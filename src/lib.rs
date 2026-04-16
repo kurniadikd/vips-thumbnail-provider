@@ -2,10 +2,10 @@ use libloading::{Library, Symbol};
 use std::ffi::{c_void, CString};
 use std::sync::OnceLock;
 use windows::{
-    core::{implement, Result, HRESULT, Error, GUID, IUnknown, Interface},
-    Win32::Foundation::BOOL,
+    core::{implement, HRESULT, Error, GUID, IUnknown, Interface},
+    Win32::Foundation::{HWND, HANDLE},
     Win32::Graphics::Gdi::{CreateBitmap, HBITMAP},
-    Win32::System::Com::{IClassFactory, IClassFactory_Impl},
+    Win32::System::Com::{IClassFactory, IClassFactory_Impl, IStream, STATFLAG_DEFAULT, CoTaskMemFree},
     Win32::System::SystemServices::DLL_PROCESS_ATTACH,
     Win32::UI::Shell::{IThumbnailProvider, IThumbnailProvider_Impl, WTS_ALPHATYPE, WTSAT_ARGB},
     Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithFile_Impl},
@@ -58,19 +58,12 @@ fn get_symbols() -> Option<&'static VipsSymbols> {
             
             let app_name = CString::new("VipsThumbExt").unwrap();
             (sym.v_init)(app_name.as_ptr());
-            (sym.v_concurrency)(4); // Keseimbangan yang baik antara speed dan resource
+            (sym.v_concurrency)(4);
 
             let _ = SYMBOLS.set(sym);
         }
     }
     SYMBOLS.get()
-}
-
-fn log_msg(msg: &str) {
-    let wide: Vec<u16> = format!("VipsThumb: {}\0", msg).encode_utf16().collect();
-    unsafe {
-        OutputDebugStringW(windows::core::PCWSTR(wide.as_ptr()));
-    }
 }
 
 type VipsInitFn = unsafe extern "C" fn(*const i8) -> i32;
@@ -86,12 +79,12 @@ type VipsImageGetInterpretationFn = unsafe extern "C" fn(*mut c_void) -> i32;
 type GObjectUnrefFn = unsafe extern "C" fn(*mut c_void);
 
 #[implement(IThumbnailProvider, IInitializeWithFile)]
-struct VipsThumbnailProvider_Impl {
+struct VipsThumbnailProvider {
     file_path: Mutex<String>,
 }
 
 impl IInitializeWithFile_Impl for VipsThumbnailProvider_Impl {
-    fn Initialize(&self, pszfilepath: &windows::core::PCWSTR, _dwmode: u32) -> Result<()> {
+    fn Initialize(&self, pszfilepath: &windows::core::PCWSTR, _dwmode: u32) -> windows_core::Result<()> {
         let mut path = self.file_path.lock().unwrap();
         unsafe {
             *path = pszfilepath.to_string()?;
@@ -101,19 +94,16 @@ impl IInitializeWithFile_Impl for VipsThumbnailProvider_Impl {
 }
 
 impl IThumbnailProvider_Impl for VipsThumbnailProvider_Impl {
-    fn GetThumbnail(&self, cx: u32, phbmp: *mut HBITMAP, pdwalpha: *mut WTS_ALPHATYPE) -> Result<()> {
+    fn GetThumbnail(&self, cx: u32, phbmp: *mut HBITMAP, pdwalpha: *mut WTS_ALPHATYPE) -> windows_core::Result<()> {
         let path = self.file_path.lock().unwrap().clone();
         if path.is_empty() { return Err(Error::from_hresult(HRESULT(-1))); }
 
         let sym = get_symbols().ok_or_else(|| Error::from_hresult(HRESULT(-1)))?;
 
         unsafe {
-            let start = std::time::Instant::now();
             let target_cx = cx.min(96);
             
-            // 1. Generate Thumbnail - Menggunakan hint untuk AVIF/HEIC
             let mut img: *mut c_void = std::ptr::null_mut();
-            // Hint [thumbnail=true,n=1,access=sequential] untuk kecepatan maksimal
             let path_with_hints = format!("{}[thumbnail=true,n=1,access=sequential]", path.replace("\\", "/"));
             let c_path = CString::new(path_with_hints).unwrap();
             
@@ -128,14 +118,13 @@ impl IThumbnailProvider_Impl for VipsThumbnailProvider_Impl {
                 target_cx as i32, 
                 height_key.as_ptr(), target_cx as i32,
                 size_key.as_ptr(), 1, // VIPS_SIZE_DOWN
-                kernel_key.as_ptr(), 0, // VIPS_KERNEL_NEAREST (Paling cepat, kualitas terendah)
+                kernel_key.as_ptr(), 0, // VIPS_KERNEL_NEAREST
                 auto_rotate_key.as_ptr(), 1,
                 std::ptr::null::<c_void>()
             ) != 0 {
                 return Err(Error::from_hresult(HRESULT(-1)));
             }
 
-            // 2. Convert to sRGB only if NOT already sRGB
             let mut final_img_tmp: *mut c_void = std::ptr::null_mut();
             let current_interp = (sym.v_interpretation)(img);
             if current_interp != 22 /* sRGB */ {
@@ -149,7 +138,6 @@ impl IThumbnailProvider_Impl for VipsThumbnailProvider_Impl {
             }
             let srgb_img = final_img_tmp;
 
-            // 3. Ensure 32-bit (BGRA) for Windows GDI
             let final_img: *mut c_void;
             let mut alpha_img: *mut c_void = std::ptr::null_mut();
             if (sym.v_bands)(srgb_img) != 4 {
@@ -163,7 +151,6 @@ impl IThumbnailProvider_Impl for VipsThumbnailProvider_Impl {
                 final_img = srgb_img;
             }
 
-            // 4. Create HBITMAP and pass to Windows
             let width = (sym.v_w)(final_img) as i32;
             let height = (sym.v_h)(final_img) as i32;
             let memory_buffer = (sym.v_data)(final_img);
@@ -184,47 +171,43 @@ impl IThumbnailProvider_Impl for VipsThumbnailProvider_Impl {
 }
 
 #[no_mangle]
-#[allow(non_snake_case)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    HRESULT(0) // S_OK
+    HRESULT(0)
 }
 
 #[no_mangle]
-#[allow(non_snake_case)]
 pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     unsafe {
         if *rclsid == GUID::from_u128(0xD3A2F1B2_7E8B_4C9D_A3D1_2F0B3C4D5E6F) {
-            let factory: IClassFactory = VipsThumbnailProviderFactory_Impl {}.into();
+            let factory: IClassFactory = VipsThumbnailProviderFactory {}.into();
             Interface::query(&factory, riid, ppv)
         } else {
-            HRESULT(-2147221231) // CLASS_E_CLASSNOTAVAILABLE
+            HRESULT(-2147221231)
         }
     }
 }
 
 #[implement(IClassFactory)]
-struct VipsThumbnailProviderFactory_Impl {}
+struct VipsThumbnailProviderFactory {}
 
 impl IClassFactory_Impl for VipsThumbnailProviderFactory_Impl {
-    fn CreateInstance(&self, _punkouter: Option<&IUnknown>, riid: *const GUID, ppv: *mut *mut c_void) -> Result<()> {
+    fn CreateInstance(&self, _punkouter: windows_core::Ref<'_, IUnknown>, riid: *const GUID, ppv: *mut *mut c_void) -> windows_core::Result<()> {
         unsafe {
-            let provider: IThumbnailProvider = VipsThumbnailProvider_Impl {
+            let provider: IThumbnailProvider = VipsThumbnailProvider {
                 file_path: Mutex::new(String::new()),
             }.into();
             Interface::query(&provider, riid, ppv).ok()
         }
     }
 
-    fn LockServer(&self, _flock: BOOL) -> Result<()> {
+    fn LockServer(&self, _flock: windows_core::BOOL) -> windows_core::Result<()> {
         Ok(())
     }
 }
 
 #[no_mangle]
-#[allow(non_snake_case)]
 pub extern "system" fn DllMain(_hmodule: *mut c_void, dwreason: u32, _lpreserved: *mut c_void) -> bool {
     if dwreason == DLL_PROCESS_ATTACH {
-        // Initialization handled in OnceLock
     }
     true
 }
